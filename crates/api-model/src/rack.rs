@@ -55,6 +55,8 @@ pub struct Rack {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FirmwareUpgradeJob {
     pub job_id: Option<String>,
+    #[serde(default)]
+    pub firmware_id: Option<String>,
     pub status: Option<String>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,

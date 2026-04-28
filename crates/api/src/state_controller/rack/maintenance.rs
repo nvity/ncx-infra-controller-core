@@ -268,6 +268,34 @@ async fn transition_to_rack_error(
     clear_maintenance_requested_on_error(rack_id, state, outcome, ctx).await
 }
 
+async fn transition_to_rack_error_with_firmware_job(
+    rack_id: &RackId,
+    state: &mut Rack,
+    firmware_id: impl Into<String>,
+    cause: impl Into<String>,
+    ctx: &mut StateHandlerContext<'_, RackStateHandlerContextObjects>,
+) -> Result<StateHandlerOutcome<RackState>, StateHandlerError> {
+    let cause = cause.into();
+    tracing::warn!(rack_id = %rack_id, %cause, "Rack firmware upgrade failed before polling started");
+
+    let now = chrono::Utc::now();
+    let job = model::rack::FirmwareUpgradeJob {
+        firmware_id: Some(firmware_id.into()),
+        status: Some("failed".into()),
+        started_at: Some(now),
+        completed_at: Some(now),
+        ..Default::default()
+    };
+    state.firmware_upgrade_job = Some(job.clone());
+    state.config.maintenance_requested = None;
+
+    let mut txn = ctx.services.db_pool.begin().await?;
+    db_rack::update_firmware_upgrade_job(txn.as_mut(), rack_id, Some(&job)).await?;
+    db_rack::update(txn.as_mut(), rack_id, &state.config).await?;
+
+    Ok(StateHandlerOutcome::transition(RackState::Error { cause }).with_txn(txn))
+}
+
 /// If `maintenance_requested` is set, clear it and persist the updated config
 /// using a fresh transaction attached to the outcome. Used when transitioning
 /// from `Maintenance` to `Error` to break the Error → Maintenance loop.
@@ -401,11 +429,13 @@ fn build_switch_device_info_request(
 /// per-device child job IDs returned by UpdateFirmwareByDeviceList.
 async fn rms_start_firmware_upgrade(
     rms_client: &dyn librms::RmsApi,
+    firmware_id: &str,
     batches: Vec<crate::rack::firmware_update::FirmwareUpdateBatchRequest>,
 ) -> model::rack::FirmwareUpgradeJob {
     let started_at = chrono::Utc::now();
     let submissions = submit_firmware_update_batches(rms_client, batches).await;
     let mut job = model::rack::FirmwareUpgradeJob {
+        firmware_id: Some(firmware_id.to_string()),
         started_at: Some(started_at),
         ..Default::default()
     };
@@ -939,9 +969,10 @@ pub async fn handle_maintenance(
                     match db_rack_firmware::find_by_id(&ctx.services.db_pool, fw_version).await {
                         Ok(fw) => fw,
                         Err(db::DatabaseError::NotFoundError { .. }) => {
-                            return transition_to_rack_error(
+                            return transition_to_rack_error_with_firmware_job(
                                 id,
                                 state,
+                                fw_version,
                                 format!("requested rack firmware '{}' not found", fw_version),
                                 ctx,
                             )
@@ -972,6 +1003,19 @@ pub async fn handle_maintenance(
                 };
 
                 if !firmware.available {
+                    if let Some(fw_version) = requested_fw_version {
+                        return transition_to_rack_error_with_firmware_job(
+                            id,
+                            state,
+                            fw_version,
+                            format!(
+                                "requested rack firmware '{}' exists but is not available",
+                                firmware.id
+                            ),
+                            ctx,
+                        )
+                        .await;
+                    }
                     return Ok(skip_firmware_upgrade_outcome(
                         id,
                         format!(
@@ -1012,9 +1056,10 @@ pub async fn handle_maintenance(
                     }
                     Ok(batches) => batches,
                     Err(error) => {
-                        return transition_to_rack_error(
+                        return transition_to_rack_error_with_firmware_job(
                             id,
                             state,
+                            firmware.id.clone(),
                             format!(
                                 "failed to build firmware update requests for firmware '{}': {}",
                                 firmware.id, error
@@ -1025,8 +1070,14 @@ pub async fn handle_maintenance(
                     }
                 };
                 let Some(rms_client) = ctx.services.rms_client.as_ref() else {
-                    return transition_to_rack_error(id, state, "RMS client not configured", ctx)
-                        .await;
+                    return transition_to_rack_error_with_firmware_job(
+                        id,
+                        state,
+                        firmware.id.clone(),
+                        "RMS client not configured",
+                        ctx,
+                    )
+                    .await;
                 };
 
                 tracing::info!(
@@ -1038,7 +1089,8 @@ pub async fn handle_maintenance(
                     switch_count = inventory.switches.len(),
                     "Rack firmware upgrade starting"
                 );
-                let mut job = rms_start_firmware_upgrade(rms_client.as_ref(), batches).await;
+                let mut job =
+                    rms_start_firmware_upgrade(rms_client.as_ref(), &firmware.id, batches).await;
 
                 let mut txn = ctx.services.db_pool.begin().await?;
                 trigger_rack_firmware_reprovisioning_requests(
@@ -1076,7 +1128,8 @@ pub async fn handle_maintenance(
                         .await;
                 };
                 let current_job = state.firmware_upgrade_job.as_ref().unwrap();
-                let job = rms_get_firmware_upgrade_status(rms_client.as_ref(), current_job).await?;
+                let mut job =
+                    rms_get_firmware_upgrade_status(rms_client.as_ref(), current_job).await?;
 
                 let all: Vec<_> = job.all_devices().collect();
                 let total = all.len();
@@ -1187,6 +1240,11 @@ pub async fn handle_maintenance(
                 }
 
                 if failed > 0 {
+                    let now = chrono::Utc::now();
+                    job.status = Some("failed".into());
+                    if job.completed_at.is_none() {
+                        job.completed_at = Some(now);
+                    }
                     db_rack::update_firmware_upgrade_job(txn.as_mut(), id, Some(&job)).await?;
                     state.firmware_upgrade_job = Some(job);
                     if state.config.maintenance_requested.is_some() {
@@ -1202,8 +1260,13 @@ pub async fn handle_maintenance(
                     .with_txn(txn));
                 }
 
-                db_rack::update_firmware_upgrade_job(txn.as_mut(), id, None).await?;
-                state.firmware_upgrade_job = None;
+                let now = chrono::Utc::now();
+                job.status = Some("completed".into());
+                if job.completed_at.is_none() {
+                    job.completed_at = Some(now);
+                }
+                db_rack::update_firmware_upgrade_job(txn.as_mut(), id, Some(&job)).await?;
+                state.firmware_upgrade_job = Some(job);
 
                 let next_maintenance_state = if let Some(artifact) = default_nvos_artifact {
                     tracing::info!(
